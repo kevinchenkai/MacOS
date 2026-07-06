@@ -652,20 +652,41 @@ check_process_name_connections "Cursor 全局进程" "cursor"
 check_process_name_connections "Codex 全局进程" "codex"
 
 print_section "最近日志"
-today_log="${APP_SUPPORT}/guiLogs/$(date +%F).txt"
+gui_logs_dir="${APP_SUPPORT}/guiLogs"
+today="$(date +%F)"
+today_log="${gui_logs_dir}/${today}.txt"
+
+# v2rayN 只在当天有事件(启动/切换/报错等)时才创建当天日志文件，
+# 因此"今天没有日志"通常无害。今天缺失时回退到最近一份日志继续扫描关键错误。
+log_to_scan=""
+log_is_today=1
 if [ -f "$today_log" ]; then
+  log_to_scan="$today_log"
+else
+  latest_log="$(ls -1 "${gui_logs_dir}"/[0-9]*.txt 2>/dev/null | sort | tail -n 1)"
+  if [ -n "$latest_log" ]; then
+    log_to_scan="$latest_log"
+    log_is_today=0
+  fi
+fi
+
+if [ -z "$log_to_scan" ]; then
+  warn "找不到任何 v2rayN 日志: ${gui_logs_dir}"
+else
   critical_log_lines="$(
-    tail -n 300 "$today_log" |
+    tail -n 300 "$log_to_scan" |
       grep -Eai 'panic|fatal|failed to start|address already in use|permission denied|tun.*fail|sing-box.*fail|xray.*fail' || true
   )"
+  if [ "$log_is_today" -eq 0 ]; then
+    latest_log_date="$(basename "$log_to_scan" .txt)"
+    ok "今天(${today})暂无 v2rayN 日志，改扫描最近一份: ${latest_log_date}"
+  fi
   if [ -n "$critical_log_lines" ]; then
-    warn "最近日志包含可疑错误，请手动查看: ${today_log}"
+    warn "最近日志包含可疑错误，请手动查看: ${log_to_scan}"
     printf '%s\n' "$critical_log_lines" | tail -n 10
   else
     ok "最近 v2rayN 日志未发现关键错误"
   fi
-else
-  warn "今天的 v2rayN 日志不存在: ${today_log}"
 fi
 
 print_section "结果"

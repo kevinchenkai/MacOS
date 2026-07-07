@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -u
 
+# 固化 PATH，确保从 cron/launchd 等精简环境调用时仍能找到系统命令
+# (route/ifconfig/netstat/scutil/ipconfig/system_profiler 多在 /usr/sbin、/sbin)。
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH}"
+
 APP_SUPPORT="${HOME}/Library/Application Support/v2rayN"
 BIN_DIR="${APP_SUPPORT}/bin"
 BIN_CONFIG_DIR="${APP_SUPPORT}/binConfigs"
@@ -18,11 +22,20 @@ CHECK_APPS="${CHECK_APPS:-Claude:/Applications/Claude.app Cursor:/Applications/C
 failures=0
 warnings=0
 
-green=$'\033[32m'
-red=$'\033[31m'
-yellow=$'\033[33m'
-bold=$'\033[1m'
-reset=$'\033[0m'
+# 仅在 stdout 连接到终端时启用颜色，重定向到文件/管道时输出纯文本，避免裸 ANSI 转义符。
+if [ -t 1 ]; then
+  green=$'\033[32m'
+  red=$'\033[31m'
+  yellow=$'\033[33m'
+  bold=$'\033[1m'
+  reset=$'\033[0m'
+else
+  green=''
+  red=''
+  yellow=''
+  bold=''
+  reset=''
+fi
 
 ok() {
   printf '%s[OK]%s %s\n' "$green" "$reset" "$*"

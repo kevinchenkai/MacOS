@@ -194,6 +194,10 @@ is_private_ip() {
     10.*|192.168.*|169.254.*)
       return 0
       ;;
+    # IPv6 链路本地(fe80::/10)与 ULA(fc00::/7)也视为本地/私网
+    fe8?:*|fe9?:*|fea?:*|feb?:*|fc*:*|fd*:*)
+      return 0
+      ;;
   esac
 
   old_ifs="$IFS"
@@ -216,14 +220,41 @@ is_private_ip() {
   return 1
 }
 
+# 按 IP 记忆化 route 查询结果：同一批连接的远端 IP 重复度很高
+# (实测 295 条连接仅 20 个唯一 IP)，同一 IP 只 fork 一次 route。
+ROUTE_TUN_CACHE=""
 route_uses_tun() {
   ip="$1"
-  route -n get "$ip" 2>/dev/null |
-    awk -v tun_addr="$TUN_ADDR" '
-      $1 == "gateway:" && $2 == tun_addr {via_gateway=1}
-      $1 == "interface:" && $2 ~ /^utun/ {via_utun=1}
-      END {exit (via_gateway && via_utun) ? 0 : 1}
-    '
+  case " ${ROUTE_TUN_CACHE} " in
+    *" ${ip}=1 "*) return 0 ;;
+    *" ${ip}=0 "*) return 1 ;;
+  esac
+
+  case "$ip" in
+    *:*)
+      # IPv6：macOS 需要 -inet6 才能查 v6 路由；TUN 的 v6 网关地址未知，
+      # 因此只要路由接口是 utun 即视为走 TUN。
+      if route -n get -inet6 "$ip" 2>/dev/null |
+        awk '$1 == "interface:" && $2 ~ /^utun/ {found=1} END {exit found ? 0 : 1}'; then
+        ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=1"
+        return 0
+      fi
+      ;;
+    *)
+      if route -n get "$ip" 2>/dev/null |
+        awk -v tun_addr="$TUN_ADDR" '
+          $1 == "gateway:" && $2 == tun_addr {via_gateway=1}
+          $1 == "interface:" && $2 ~ /^utun/ {via_utun=1}
+          END {exit (via_gateway && via_utun) ? 0 : 1}
+        '; then
+        ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=1"
+        return 0
+      fi
+      ;;
+  esac
+
+  ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=0"
+  return 1
 }
 
 expand_descendant_pids() {
@@ -415,6 +446,20 @@ printf '要求 TUN: %s\n' "$REQUIRE_TUN"
 
 default_iface="$(get_default_interface)"
 default_gateway="$(get_default_gateway)"
+
+# 并行发起全部网络探测(原为 6 次串行 curl，每次 ~0.8s):
+# 后台同时请求，并与下面的本地信息收集重叠;相同的"代理出口 IP"请求只发一次，
+# 结果同时供开头展示和后面"网络连通性"段复用。
+NET_PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/check_v2rayn.XXXXXX")"
+trap 'rm -rf "$NET_PROBE_DIR"' EXIT
+if [ -n "$default_iface" ]; then
+  curl_body --interface "$default_iface" "$IP_URL" > "${NET_PROBE_DIR}/physical_ip" &
+fi
+curl_body --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "$IP_URL" > "${NET_PROBE_DIR}/proxy_ip" &
+curl_body "$IP_URL" > "${NET_PROBE_DIR}/direct_ip" &
+curl_status --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "$TEST_URL" > "${NET_PROBE_DIR}/proxy_status" &
+curl_status "$TEST_URL" > "${NET_PROBE_DIR}/direct_status" &
+
 default_lan_ip=""
 if [ -n "$default_iface" ]; then
   default_lan_ip="$(get_interface_ipv4 "$default_iface" | tr -d '\r\n')"
@@ -424,11 +469,16 @@ wifi_network=""
 if [ -n "$wifi_iface" ]; then
   wifi_network="$(get_wifi_network "$wifi_iface" | tr -d '\r\n')"
 fi
-direct_over_physical_ip=""
-if [ -n "$default_iface" ]; then
-  direct_over_physical_ip="$(curl_body --interface "$default_iface" "$IP_URL" | tr -d '\r\n')"
-fi
-early_proxy_ip="$(curl_body --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "$IP_URL" | tr -d '\r\n')"
+
+wait
+
+read_probe() {
+  [ -f "${NET_PROBE_DIR}/$1" ] || return 0
+  tr -d '\r\n' < "${NET_PROBE_DIR}/$1"
+}
+
+direct_over_physical_ip="$(read_probe physical_ip)"
+early_proxy_ip="$(read_probe proxy_ip)"
 
 print_section "当前 Mac 网络"
 printf '默认接口: %s\n' "${default_iface:-未知}"
@@ -603,22 +653,23 @@ else
 fi
 
 print_section "网络连通性"
-proxy_status="$(curl_status --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "$TEST_URL")"
+# 探测请求已在脚本开头并行发起，此处直接读取结果。
+proxy_status="$(read_probe proxy_status)"
 if [ "$proxy_status" = "204" ] || [ "$proxy_status" = "200" ]; then
   ok "显式代理访问成功: HTTP ${proxy_status}"
 else
   fail "显式代理访问失败: HTTP ${proxy_status:-无响应}"
 fi
 
-direct_status="$(curl_status "$TEST_URL")"
+direct_status="$(read_probe direct_status)"
 if [ "$direct_status" = "204" ] || [ "$direct_status" = "200" ]; then
   ok "普通请求访问成功: HTTP ${direct_status}"
 else
   fail "普通请求访问失败: HTTP ${direct_status:-无响应}"
 fi
 
-proxy_ip="$(curl_body --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "$IP_URL" | tr -d '\r\n')"
-direct_ip="$(curl_body "$IP_URL" | tr -d '\r\n')"
+proxy_ip="$early_proxy_ip"
+direct_ip="$(read_probe direct_ip)"
 
 if [ -n "$proxy_ip" ]; then
   ok "显式代理出口 IP: ${proxy_ip}"

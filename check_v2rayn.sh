@@ -17,7 +17,7 @@ TUN_ADDR="${TUN_ADDR:-172.18.0.1}"
 TEST_URL="${TEST_URL:-https://www.google.com/generate_204}"
 IP_URL="${IP_URL:-https://api.ipify.org}"
 TIMEOUT="${TIMEOUT:-15}"
-CHECK_APPS="${CHECK_APPS:-Claude:/Applications/Claude.app Cursor:/Applications/Cursor.app Codex:/Applications/Codex.app}"
+CHECK_APPS="${CHECK_APPS:-Claude:/Applications/Claude.app Cursor:/Applications/Cursor.app ChatGPT:/Applications/ChatGPT.app}"
 
 failures=0
 warnings=0
@@ -713,7 +713,9 @@ check_txt_marker_process_tree_connections "Claude Code CLI 桌面内置版" "${H
 print_section "进程名兜底连接检查"
 check_process_name_connections "Claude 全局进程" "claude"
 check_process_name_connections "Cursor 全局进程" "cursor"
-check_process_name_connections "Codex 全局进程" "codex"
+# ChatGPT 桌面版已更名，但其内部进程仍大量以 Codex 命名(Codex Framework/
+# Renderer/Service、Resources/codex),两者都需匹配才不漏。
+check_process_name_connections "ChatGPT 全局进程" "chatgpt|codex"
 
 print_section "最近日志"
 gui_logs_dir="${APP_SUPPORT}/guiLogs"

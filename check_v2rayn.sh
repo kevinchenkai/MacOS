@@ -531,15 +531,36 @@ else
 fi
 
 print_section "监听端口"
+# macOS 上经 sudo 启动的 Xray，lsof 经常看不到 LISTEN；用 netstat / 连通性兜底。
 listen_line="$(lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 {print}')"
-if printf '%s\n' "$listen_line" | grep -q "$PROXY_HOST:$PROXY_PORT"; then
-  ok "本地代理端口正在监听: $PROXY_HOST:$PROXY_PORT"
+listen_via="lsof"
+if ! printf '%s\n' "$listen_line" | grep -q "$PROXY_HOST:$PROXY_PORT"; then
+  # netstat 里监听地址为 HOST.PORT 格式(如 127.0.0.1.10808)。
+  # 精确匹配 HOST.PORT，与 lsof 主判定同口径(要求监听在 PROXY_HOST)，
+  # 避免用 ".PORT" 正则(. 是通配符会误匹配 xPORT)或放宽 HOST 约束。
+  netstat_listen="$(netstat -an -p tcp 2>/dev/null | awk -v want="${PROXY_HOST}.${PROXY_PORT}" '$4 == want && $6 == "LISTEN" {print}')"
+  if [ -n "$netstat_listen" ]; then
+    listen_line="$netstat_listen"
+    listen_via="netstat"
+  elif nc -z -G 1 "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1 ||
+       curl -sS -o /dev/null --max-time 2 --proxy "http://${PROXY_HOST}:${PROXY_PORT}" "http://example.com" >/dev/null 2>&1; then
+    listen_line="reachable ${PROXY_HOST}:${PROXY_PORT}"
+    listen_via="probe"
+  else
+    listen_line=""
+  fi
+fi
+
+if [ -n "$listen_line" ]; then
+  ok "本地代理端口正在监听: $PROXY_HOST:$PROXY_PORT (${listen_via})"
 else
   fail "本地代理端口未监听: $PROXY_HOST:$PROXY_PORT"
 fi
 
 if printf '%s\n' "$listen_line" | grep -qi 'xray'; then
   ok "监听 $PROXY_PORT 的进程是 Xray"
+elif pgrep -af '[x]ray.*run -c|[x]ray/xray' >/dev/null && [ -n "$listen_line" ]; then
+  ok "监听 $PROXY_PORT 对应 Xray 核心正在运行 (${listen_via})"
 else
   warn "监听 $PROXY_PORT 的进程未明确显示为 Xray"
 fi

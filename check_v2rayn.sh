@@ -220,41 +220,68 @@ is_private_ip() {
   return 1
 }
 
-# 按 IP 记忆化 route 查询结果：同一批连接的远端 IP 重复度很高
-# (实测 295 条连接仅 20 个唯一 IP)，同一 IP 只 fork 一次 route。
+# 探测 v2rayN 的 TUN 接口名：ifconfig 里 inet 地址为 TUN_ADDR 的那个 utun。
+# 用于把 v2rayN 的 utun 与其它 VPN(如奇安信 aTrust 的 utun)区分开，
+# 避免把走 aTrust 的公司内网连接误判成"未走 v2rayN 的公网连接"。
+V2RAYN_TUN_IFACE=""
+detect_v2rayn_tun_iface() {
+  V2RAYN_TUN_IFACE="$(
+    ifconfig 2>/dev/null | awk -v addr="$TUN_ADDR" '
+      /^[a-z0-9]+: / {iface=$1; sub(":", "", iface)}
+      $1 == "inet" && $2 == addr {print iface; exit}
+    '
+  )"
+}
+
+# 按 IP 记忆化 route 查询：返回 v2rayn / other / no。
+#   v2rayn = 接口是 utun 且网关为 TUN_ADDR(v4)或接口即 V2RAYN_TUN_IFACE(v6)
+#   other  = 接口是 utun 但不是 v2rayN 的(典型为 aTrust)
+#   no     = 未走任何 utun
+# 同一批连接远端 IP 重复度很高(实测 295 条仅 20 个唯一 IP)，同一 IP 只 fork 一次。
 ROUTE_TUN_CACHE=""
-route_uses_tun() {
+route_tun_kind() {
   ip="$1"
   case " ${ROUTE_TUN_CACHE} " in
-    *" ${ip}=1 "*) return 0 ;;
-    *" ${ip}=0 "*) return 1 ;;
+    *" ${ip}=v2rayn "*) printf 'v2rayn'; return ;;
+    *" ${ip}=other "*)  printf 'other';  return ;;
+    *" ${ip}=no "*)     printf 'no';     return ;;
   esac
 
+  kind="no"
   case "$ip" in
     *:*)
-      # IPv6：macOS 需要 -inet6 才能查 v6 路由；TUN 的 v6 网关地址未知，
-      # 因此只要路由接口是 utun 即视为走 TUN。
-      if route -n get -inet6 "$ip" 2>/dev/null |
-        awk '$1 == "interface:" && $2 ~ /^utun/ {found=1} END {exit found ? 0 : 1}'; then
-        ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=1"
-        return 0
-      fi
+      # IPv6：拿不到 v4 网关，按接口名区分:命中 v2rayN 接口为 v2rayn，其它 utun 为 other。
+      kind="$(
+        route -n get -inet6 "$ip" 2>/dev/null |
+          awk -v v2iface="$V2RAYN_TUN_IFACE" '
+            $1 == "interface:" {
+              if (v2iface != "" && $2 == v2iface) print "v2rayn"
+              else if ($2 ~ /^utun/) print "other"
+              else print "no"
+              exit
+            }
+          '
+      )"
       ;;
     *)
-      if route -n get "$ip" 2>/dev/null |
-        awk -v tun_addr="$TUN_ADDR" '
-          $1 == "gateway:" && $2 == tun_addr {via_gateway=1}
-          $1 == "interface:" && $2 ~ /^utun/ {via_utun=1}
-          END {exit (via_gateway && via_utun) ? 0 : 1}
-        '; then
-        ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=1"
-        return 0
-      fi
+      kind="$(
+        route -n get "$ip" 2>/dev/null |
+          awk -v tun_addr="$TUN_ADDR" '
+            $1 == "gateway:" {gw=$2}
+            $1 == "interface:" {iface=$2}
+            END {
+              if (iface ~ /^utun/) {
+                if (gw == tun_addr) print "v2rayn"; else print "other"
+              } else print "no"
+            }
+          '
+      )"
       ;;
   esac
+  [ -z "$kind" ] && kind="no"
 
-  ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=0"
-  return 1
+  ROUTE_TUN_CACHE="${ROUTE_TUN_CACHE} ${ip}=${kind}"
+  printf '%s' "$kind"
 }
 
 expand_descendant_pids() {
@@ -312,6 +339,7 @@ check_connection_lines() {
   explicit_proxy=0
   tun_socket=0
   tun_route=0
+  other_tun=0
   local_skip=0
   bad=0
 
@@ -349,9 +377,15 @@ check_connection_lines() {
       continue
     fi
 
-    # 仅对公网 remote_ip 才 fork route 查询是否走 utun
-    if route_uses_tun "$remote_ip"; then
+    # 仅对公网 remote_ip 才 fork route 查询走哪个 TUN
+    tun_kind="$(route_tun_kind "$remote_ip")"
+    if [ "$tun_kind" = "v2rayn" ]; then
       tun_route=$((tun_route + 1))
+      continue
+    fi
+    if [ "$tun_kind" = "other" ]; then
+      # 走其它 VPN(如 aTrust)的连接,通常是公司内网访问,不算未走 v2rayN。
+      other_tun=$((other_tun + 1))
       continue
     fi
 
@@ -362,7 +396,7 @@ $conn_lines
 EOF
 
   if [ "$bad" -eq 0 ]; then
-    ok "${app_label} 连接检查通过: total=${total}, local_proxy=${explicit_proxy}, tun_socket=${tun_socket}, tun_route=${tun_route}, local_skip=${local_skip}"
+    ok "${app_label} 连接检查通过: total=${total}, local_proxy=${explicit_proxy}, tun_socket=${tun_socket}, tun_route=${tun_route}, other_tun=${other_tun}, local_skip=${local_skip}"
   else
     fail "${app_label} 连接检查失败: ${bad}/${total} 条连接未确认走 v2rayN"
   fi
@@ -593,13 +627,14 @@ for proto in HTTP HTTPS SOCKS; do
 done
 
 print_section "TUN 和路由"
+detect_v2rayn_tun_iface
 tun_ifaces="$(ifconfig 2>/dev/null | awk -v addr="$TUN_ADDR" '
   /^[a-z0-9]+: / {iface=$1; sub(":", "", iface)}
   $1 == "inet" && $2 == addr {print iface}
 ')"
 
 if [ -n "$tun_ifaces" ]; then
-  ok "发现 TUN 地址 ${TUN_ADDR}: $(printf '%s' "$tun_ifaces" | tr '\n' ' ')"
+  ok "发现 v2rayN TUN 地址 ${TUN_ADDR}: $(printf '%s' "$tun_ifaces" | tr '\n' ' ')"
 else
   if [ "$REQUIRE_TUN" = "1" ]; then
     fail "未发现 TUN 地址 ${TUN_ADDR}"
@@ -627,6 +662,25 @@ else
   else
     warn "未发现指向 utun 的透明代理路由"
   fi
+fi
+
+# 检测同时在用的其它 VPN(如奇安信 aTrust):存在指向非 v2rayN utun 的路由。
+# 这类 VPN 接管公司内网访问,与 v2rayN 的全局代理各管一段,通常可共存;
+# 此处仅提示,便于排查内网/公网流量归属。
+other_tun_ifaces="$(
+  printf '%s\n' "$route_dump" |
+    awk -v v2iface="$V2RAYN_TUN_IFACE" '$NF ~ /^utun/ && $NF != v2iface {print $NF}' |
+    sort -u | tr '\n' ' '
+)"
+if [ -n "${other_tun_ifaces% }" ]; then
+  if pgrep -af '[a]Trust|[s]angfor' >/dev/null; then
+    warn "检测到 aTrust(奇安信零信任)共存,占用接口: ${other_tun_ifaces}"
+    warn "  → aTrust 接管公司内网,v2rayN 接管公网,各管一段可共存;若内网/公网互串,建议在 v2rayN 路由里对内网网段设直连,并确保先启 aTrust 再启 v2rayN。"
+  else
+    warn "检测到其它 VPN/TUN 共存,占用接口: ${other_tun_ifaces}(非 v2rayN)"
+  fi
+else
+  ok "未发现与 v2rayN 冲突的其它 VPN/TUN"
 fi
 
 print_section "配置校验"

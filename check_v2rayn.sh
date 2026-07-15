@@ -784,6 +784,7 @@ done
 print_section "CLI 连接检查"
 check_txt_marker_process_tree_connections "Claude Code CLI 本地版" "${HOME}/.local/share/claude/versions/"
 check_txt_marker_process_tree_connections "Claude Code CLI 桌面内置版" "${HOME}/Library/Application Support/Claude/claude-code/"
+check_txt_marker_process_tree_connections "Grok CLI" "${HOME}/.grok/"
 
 print_section "进程名兜底连接检查"
 check_process_name_connections "Claude 全局进程" "claude"
@@ -791,6 +792,9 @@ check_process_name_connections "Cursor 全局进程" "cursor"
 # ChatGPT 桌面版已更名，但其内部进程仍大量以 Codex 命名(Codex Framework/
 # Renderer/Service、Resources/codex),两者都需匹配才不漏。
 check_process_name_connections "ChatGPT 全局进程" "chatgpt|codex"
+# grok CLI 的可执行名为 grok-macos-aarch64，lsof COMMAND 列会截断成 grok-maco，
+# 用 grok 子串匹配即可覆盖。
+check_process_name_connections "Grok 全局进程" "grok"
 
 print_section "最近日志"
 gui_logs_dir="${APP_SUPPORT}/guiLogs"

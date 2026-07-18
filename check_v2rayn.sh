@@ -19,6 +19,12 @@ IP_URL="${IP_URL:-https://api.ipify.org}"
 TIMEOUT="${TIMEOUT:-15}"
 CHECK_APPS="${CHECK_APPS:-Claude:/Applications/Claude.app Cursor:/Applications/Cursor.app ChatGPT:/Applications/ChatGPT.app}"
 
+# 代理服务器(入口)地址与端口。留空则从 xray 配置自动探测出站 server。
+# "连不上 server" 通常是这个入口的 TCP 不可达,单独探测便于定位。
+SERVER_ADDR="${SERVER_ADDR:-}"
+SERVER_PORT="${SERVER_PORT:-}"
+SERVER_PROBE_TIMEOUT="${SERVER_PROBE_TIMEOUT:-5}"
+
 failures=0
 warnings=0
 
@@ -90,6 +96,41 @@ curl_status() {
 
 curl_body() {
   curl -L -sS --max-time "$TIMEOUT" "$@" 2>/dev/null
+}
+
+# 从 xray 配置提取代理出站(vless/vmess/trojan/shadowsocks 等)的 server 地址与端口。
+# 输出 "地址 端口"(空格分隔);无法解析时输出空。DNS 出站(119.29.29.29 等)已排除:
+# 只取 vnext/servers 里紧邻 address 的 port，跳过 policy/dns/inbound 段。
+extract_server_from_config() {
+  cfg="${BIN_CONFIG_DIR}/config.json"
+  [ -f "$cfg" ] || return 0
+  # 取 outbounds 段内第一个 (address, port) 对:优先匹配代理协议出站的 vnext/servers。
+  awk '
+    /"outbounds"/ {in_out=1}
+    in_out && /"protocol"/ {
+      if ($0 ~ /"vless"|"vmess"|"trojan"|"shadowsocks"|"socks"|"http"/) proxy_ob=1
+      else if ($0 ~ /"freedom"|"blackhole"|"dns"/) proxy_ob=0
+    }
+    in_out && proxy_ob && match($0, /"address"[[:space:]]*:[[:space:]]*"[^"]+"/) {
+      s=substr($0, RSTART, RLENGTH); gsub(/.*"address"[[:space:]]*:[[:space:]]*"/, "", s); gsub(/".*/, "", s)
+      addr=s
+    }
+    in_out && proxy_ob && addr != "" && match($0, /"port"[[:space:]]*:[[:space:]]*[0-9]+/) {
+      p=substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", p)
+      print addr" "p; exit
+    }
+  ' "$cfg"
+}
+
+# 探测 host:port 的 TCP 可达性,返回 0 可达 / 1 不可达。优先 nc,回退到 bash /dev/tcp。
+probe_tcp() {
+  host="$1"; port="$2"; t="${3:-5}"
+  if have_cmd nc; then
+    nc -z -G "$t" "$host" "$port" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  # bash /dev/tcp 兜底(无超时控制,靠外层 curl/nc 已足够,此处尽力而为)
+  (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 && { exec 3>&- 3<&-; return 0; }
+  return 1
 }
 
 get_default_interface() {
@@ -725,6 +766,37 @@ if [ -f "${GUI_CONFIG_DIR}/guiNConfig.json" ]; then
   fi
 else
   warn "找不到 guiNConfig.json，跳过 GUI 配置检查"
+fi
+
+print_section "代理服务器可达性"
+# server 入口的 TCP 可达性是代理能工作的前提。"连不上 server" 多因这里不通
+# (服务器宕机/被墙/端口变更/本地网络故障),单独探测便于第一时间定位。
+srv_addr="$SERVER_ADDR"
+srv_port="$SERVER_PORT"
+if [ -z "$srv_addr" ] || [ -z "$srv_port" ]; then
+  srv_pair="$(extract_server_from_config)"
+  [ -z "$srv_addr" ] && srv_addr="${srv_pair%% *}"
+  [ -z "$srv_port" ] && srv_port="${srv_pair##* }"
+fi
+
+if [ -z "$srv_addr" ] || [ -z "$srv_port" ]; then
+  warn "未能确定代理 server 地址/端口(可用 SERVER_ADDR/SERVER_PORT 指定),跳过可达性检查"
+else
+  printf '代理服务器: %s:%s\n' "$srv_addr" "$srv_port"
+  if probe_tcp "$srv_addr" "$srv_port" "$SERVER_PROBE_TIMEOUT"; then
+    ok "代理 server TCP 可达: ${srv_addr}:${srv_port}"
+  else
+    fail "代理 server TCP 不可达: ${srv_addr}:${srv_port} (服务器宕机/被墙/端口变更/本地断网?)"
+  fi
+
+  # 对比:同一 server 若走物理网卡直连仍不可达,基本可判定是服务器或链路问题而非本地代理配置。
+  if [ -n "$default_iface" ] && have_cmd nc; then
+    if nc -z -G "$SERVER_PROBE_TIMEOUT" -b "$default_iface" "$srv_addr" "$srv_port" >/dev/null 2>&1; then
+      ok "经物理接口 ${default_iface} 直连 server 也可达"
+    else
+      warn "经物理接口 ${default_iface} 直连 server 不可达(可能被墙或服务器异常;TUN 全局下此结果仅供参考)"
+    fi
+  fi
 fi
 
 print_section "网络连通性"

@@ -1,7 +1,7 @@
 # v2rayN × aTrust 共存配置清单
 
 > 目标：让 aTrust（奇安信零信任）接管公司内网与其网关，v2rayN 接管公网代理，两者互不干扰。
-> 生成日期：2026-07-11 ｜ 基于本机实测路由表与连接状态核对。
+> 生成日期：2026-07-11 ｜ 最后核对：2026-07-25（基于本机实测路由表与连接状态）。
 
 ---
 
@@ -10,7 +10,7 @@
 **将以下网段完整填入「路由排除地址」（逗号分隔）：**
 
 ```
-10.0.0.0/8,172.16.0.0/12,198.18.0.0/15,114.255.44.0/24,36.112.24.0/24
+10.0.0.0/8,172.16.0.0/12,198.18.0.0/15,114.255.44.0/24,36.112.24.0/24,74.211.108.213/32
 ```
 
 ### 每条的依据
@@ -22,6 +22,7 @@
 | `198.18.0.0/15` | 公司内网 | aTrust 大量使用 `198.18.x` 子网 | 必需 |
 | `114.255.44.0/24` | **aTrust 网关（公网）** | 本机 aTrustAge 进程正连 `114.255.44.135:4435`（SDP 控制通道，北京联通）。走代理会导致 aTrust 掉线 | **强烈必需** |
 | `36.112.24.0/24` | aTrust 备用网关（公网） | 北京国内公网段（AS4847），疑似 aTrust 备用接入点，直连更稳 | 建议 |
+| `74.211.108.213/32` | **代理 server 自身** | v2rayN 的 vless 入口。若它自己也被 TUN 接管会形成路由环路，必须直连 | **强烈必需** |
 
 ### 与你原列表的差异
 
@@ -52,22 +53,40 @@
 
 **预期结果：**
 
-- 「TUN 和路由」段出现：`检测到 aTrust（奇安信零信任）共存，占用接口: utun7`（提示性 WARN，属正常）。
-- 各 App/CLI 连接检查为 `[OK]`，走公司内网的连接计入 `other_tun`，不再误报 FAIL。
+- 「TUN 和路由」段出现：`检测到 aTrust(奇安信零信任)共存,占用接口: utunN`（提示性 WARN，属正常）。
+- 各 App/CLI 连接检查为 `[OK]`：走公司内网的连接计入 `other_tun`，命中上面排除列表的连接计入 `route_excluded`，均不再误报 FAIL。
+- 「代理服务器可达性」段：`74.211.108.213:443` TCP 可达。
 - 「网络连通性」段：v2rayN 出口 IP 正常、公网可达。
 
 **手动验证内网与网关走向：**
 
+> ⚠️ `utun` 编号**每次重启会变**（本机曾是 aTrust=utun7 / v2rayN=utun12，现为 utun8 / utun98），
+> 所以不要照抄固定编号。下面的脚本自动推导出两个接口名再做比对。
+
 ```bash
-# 内网应走 aTrust（utun7）
-route -n get 10.34.2.42 | grep interface     # 预期 utun7
-route -n get 172.20.1.1 | grep interface     # 预期 utun7
+# 自动识别两个隧道接口：v2rayN 认 TUN 网关地址 172.18.0.1，其余 utun 即其它 VPN
+V2RAYN_IF=$(ifconfig | awk '/^[a-z0-9]+: /{i=$1;sub(":","",i)} $1=="inet" && $2=="172.18.0.1"{print i;exit}')
+ATRUST_IF=$(netstat -rn -f inet | awk -v v="$V2RAYN_IF" '$NF ~ /^utun/ && $NF != v {print $NF}' | sort -u | head -1)
+echo "v2rayN=$V2RAYN_IF  aTrust=$ATRUST_IF"
 
-# aTrust 公网网关应直连（en0），不走 v2rayN
-route -n get 114.255.44.135 | grep interface # 预期 en0（物理网卡）
+# 逐项比对实际走向与预期
+chk() { got=$(route -n get "$1" 2>/dev/null | awk '$1=="interface:"{print $2}')
+        [ "$got" = "$2" ] && echo "✅ $1 -> $got" || echo "❌ $1 -> ${got:-无路由} (预期 $2)"; }
 
-# 普通公网应走 v2rayN（utun12）或代理
-route -n get 8.8.8.8 | grep interface        # 预期 utun12
+chk 10.34.2.42     "$ATRUST_IF"   # 公司内网 -> aTrust
+chk 172.20.1.1     "$ATRUST_IF"   # 公司内网 -> aTrust
+chk 114.255.44.135 en0            # aTrust 网关 -> 物理直连
+chk 74.211.108.213 en0            # 代理 server -> 物理直连（避免环路）
+chk 8.8.8.8        "$V2RAYN_IF"   # 普通公网 -> v2rayN
+```
+
+上述 5 项在 2026-07-25 本机实测全部为 ✅。若某项为 ❌，对照第一节确认对应网段是否已填入「路由排除地址」。
+
+**查看 aTrust 实际接管了哪些网段：**
+
+```bash
+V2RAYN_IF=$(ifconfig | awk '/^[a-z0-9]+: /{i=$1;sub(":","",i)} $1=="inet" && $2=="172.18.0.1"{print i;exit}')
+netstat -rn -f inet | awk -v v="$V2RAYN_IF" '$NF ~ /^utun/ && $NF != v {print $1, $NF}'
 ```
 
 ---
@@ -75,5 +94,6 @@ route -n get 8.8.8.8 | grep interface        # 预期 utun12
 ## 四、注意事项
 
 - aTrust 是公司零信任 VPN，本清单只调整 v2rayN 侧的路由排除与启动顺序，**不修改 aTrust 的任何安全策略或隧道配置**。
-- 若公司 IT 后续调整了 aTrust 网关地址或内网网段，`114.255.44.x` / `36.112.24.x` 及内网大段可能需要相应更新；届时可用 `netstat -rn -f inet | awk '$NF=="utun7"'` 重新查看 aTrust 实际接管的网段。
+- 若公司 IT 后续调整了 aTrust 网关地址或内网网段，`114.255.44.x` / `36.112.24.x` 及内网大段可能需要相应更新；届时用上一节「查看 aTrust 实际接管了哪些网段」的命令重新核对（不要按固定 utun 编号过滤，编号每次重启都会变）。
+- `check_v2rayn.sh` 会直接读取 `guiNConfig.json` 的 `TunModeItem.RouteExcludeAddress` 做 CIDR 匹配，把命中的连接计为 `route_excluded` 而非报错。因此这里的排除列表改动后**脚本无需同步修改**，但反过来说：**误加**网段会让脚本不再对该段告警，请只填确实要直连的地址。
 - 「路由排除地址」中的网段会**绕过 v2rayN 的代理与 TUN 兜底、直接从物理网卡出**。确认这些段都是你希望直连的，勿将想走代理的公网段误加入。

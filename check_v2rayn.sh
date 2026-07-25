@@ -261,6 +261,70 @@ is_private_ip() {
   return 1
 }
 
+# 读取 v2rayN「TUN 模式设置 → 路由排除地址」(guiNConfig.json 的
+# TunModeItem.RouteExcludeAddress)。这些网段被刻意配置为绕过 TUN、从物理网卡直连,
+# 因此对它们的连接"不走 v2rayN"是预期行为,不该报 FAIL。
+# 从配置动态读取而非写死,IT 调整 aTrust 网段后无需改脚本。
+ROUTE_EXCLUDE_CIDRS=""
+ROUTE_EXCLUDE_LOADED=0
+load_route_exclude_cidrs() {
+  [ "$ROUTE_EXCLUDE_LOADED" -eq 1 ] && return
+  ROUTE_EXCLUDE_LOADED=1
+  cfg="${GUI_CONFIG_DIR}/guiNConfig.json"
+  [ -f "$cfg" ] || return
+  # 去掉空白后按 JSON 数组取值，同时兼容格式化与压缩过的配置。只保留 IPv4 CIDR。
+  ROUTE_EXCLUDE_CIDRS="$(
+    tr -d ' \t\n' < "$cfg" |
+      sed -n 's/.*"RouteExcludeAddress":\[\([^]]*\)\].*/\1/p' |
+      tr ',' '\n' | tr -d '"' |
+      awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print}'
+  )"
+}
+
+ipv4_to_int() {
+  old_ifs="$IFS"
+  IFS=.
+  set -- $1
+  IFS="$old_ifs"
+  printf '%s' "$(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 ))"
+}
+
+# 判断 IPv4 是否落在「路由排除地址」内(逐段做掩码比较)。
+is_route_excluded_ip() {
+  ip="$1"
+  # 仅处理点分四段 IPv4；IPv6/主机名一律不算排除
+  case "$ip" in
+    *:*) return 1 ;;
+    *[!0-9.]*) return 1 ;;
+  esac
+  case "$ip" in
+    *.*.*.*) : ;;
+    *) return 1 ;;
+  esac
+
+  load_route_exclude_cidrs
+  [ -z "$ROUTE_EXCLUDE_CIDRS" ] && return 1
+
+  ipnum="$(ipv4_to_int "$ip")"
+  while IFS= read -r cidr; do
+    [ -z "$cidr" ] && continue
+    base="${cidr%/*}"
+    bits="${cidr#*/}"
+    [ "$bits" -ge 0 ] && [ "$bits" -le 32 ] 2>/dev/null || continue
+    if [ "$bits" -eq 0 ]; then
+      return 0
+    fi
+    mask=$(( 0xFFFFFFFF ^ ((1 << (32 - bits)) - 1) ))
+    basenum="$(ipv4_to_int "$base")"
+    if [ $(( ipnum & mask )) -eq $(( basenum & mask )) ]; then
+      return 0
+    fi
+  done <<EOF
+$ROUTE_EXCLUDE_CIDRS
+EOF
+  return 1
+}
+
 # 探测 v2rayN 的 TUN 接口名：ifconfig 里 inet 地址为 TUN_ADDR 的那个 utun。
 # 用于把 v2rayN 的 utun 与其它 VPN(如奇安信 aTrust 的 utun)区分开，
 # 避免把走 aTrust 的公司内网连接误判成"未走 v2rayN 的公网连接"。
@@ -381,6 +445,7 @@ check_connection_lines() {
   tun_socket=0
   tun_route=0
   other_tun=0
+  route_excluded=0
   local_skip=0
   bad=0
 
@@ -430,6 +495,14 @@ check_connection_lines() {
       continue
     fi
 
+    # 命中 v2rayN「路由排除地址」的连接是被刻意放行走物理网卡的(如 aTrust 网关、
+    # 代理 server 自身),属预期直连,不算漏代理。放在 route 判定之后,
+    # 这样真正走了 TUN 的仍优先计入 tun_route。
+    if is_route_excluded_ip "$remote_ip"; then
+      route_excluded=$((route_excluded + 1))
+      continue
+    fi
+
     bad=$((bad + 1))
     fail "${app_label} 发现未走 v2rayN 的公网连接: ${command_name}/${pid} ${endpoint}"
   done <<EOF
@@ -437,7 +510,7 @@ $conn_lines
 EOF
 
   if [ "$bad" -eq 0 ]; then
-    ok "${app_label} 连接检查通过: total=${total}, local_proxy=${explicit_proxy}, tun_socket=${tun_socket}, tun_route=${tun_route}, other_tun=${other_tun}, local_skip=${local_skip}"
+    ok "${app_label} 连接检查通过: total=${total}, local_proxy=${explicit_proxy}, tun_socket=${tun_socket}, tun_route=${tun_route}, other_tun=${other_tun}, route_excluded=${route_excluded}, local_skip=${local_skip}"
   else
     fail "${app_label} 连接检查失败: ${bad}/${total} 条连接未确认走 v2rayN"
   fi
@@ -775,9 +848,21 @@ srv_addr="$SERVER_ADDR"
 srv_port="$SERVER_PORT"
 if [ -z "$srv_addr" ] || [ -z "$srv_port" ]; then
   srv_pair="$(extract_server_from_config)"
-  [ -z "$srv_addr" ] && srv_addr="${srv_pair%% *}"
-  [ -z "$srv_port" ] && srv_port="${srv_pair##* }"
+  # 只有确实解析出 "地址 端口" 两段时才拆分:否则 ${srv_pair##* } 会把地址当端口
+  # (单 token 时前缀删除不匹配,原样返回),导致探测 host:host 这种无效目标。
+  case "$srv_pair" in
+    *' '*)
+      [ -z "$srv_addr" ] && srv_addr="${srv_pair%% *}"
+      [ -z "$srv_port" ] && srv_port="${srv_pair##* }"
+      ;;
+  esac
 fi
+
+# 端口必须是 1-65535 的纯数字,否则视为解析失败(避免把地址/垃圾串当端口去探测)。
+case "$srv_port" in
+  '' | *[!0-9]*) srv_port="" ;;
+  *) if [ "$srv_port" -lt 1 ] || [ "$srv_port" -gt 65535 ]; then srv_port=""; fi ;;
+esac
 
 if [ -z "$srv_addr" ] || [ -z "$srv_port" ]; then
   warn "未能确定代理 server 地址/端口(可用 SERVER_ADDR/SERVER_PORT 指定),跳过可达性检查"
@@ -896,7 +981,26 @@ else
   )"
   if [ "$log_is_today" -eq 0 ]; then
     latest_log_date="$(basename "$log_to_scan" .txt)"
-    ok "今天(${today})暂无 v2rayN 日志，改扫描最近一份: ${latest_log_date}"
+    # 回退日志若过旧，说明扫描结果对"当前"几乎没有参考价值(可能 v2rayN 已停很久)，
+    # 此时降级为 WARN，避免用陈旧日志给出"未发现错误"的虚假安心。
+    log_age_days="$(
+      awk -v d="$latest_log_date" -v t="$today" '
+        function days(s,  y,m,dd,a) {
+          split(s, a, "-"); y=a[1]+0; m=a[2]+0; dd=a[3]+0
+          if (m <= 2) { y--; m += 12 }
+          return int(365.25*y) + int(30.6001*(m+1)) + dd
+        }
+        BEGIN { print days(t) - days(d) }
+      ' 2>/dev/null
+    )"
+    case "$log_age_days" in
+      '' | *[!0-9]*) log_age_days=0 ;;
+    esac
+    if [ "$log_age_days" -gt 7 ]; then
+      warn "今天(${today})暂无 v2rayN 日志，最近一份为 ${latest_log_date}(${log_age_days} 天前)，已过旧，结论仅供参考"
+    else
+      ok "今天(${today})暂无 v2rayN 日志，改扫描最近一份: ${latest_log_date}(${log_age_days} 天前)"
+    fi
   fi
   if [ -n "$critical_log_lines" ]; then
     warn "最近日志包含可疑错误，请手动查看: ${log_to_scan}"

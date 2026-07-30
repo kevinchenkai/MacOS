@@ -25,6 +25,53 @@ SERVER_ADDR="${SERVER_ADDR:-}"
 SERVER_PORT="${SERVER_PORT:-}"
 SERVER_PROBE_TIMEOUT="${SERVER_PROBE_TIMEOUT:-5}"
 
+usage() {
+  cat <<USAGE
+用法: $(basename "$0") [-h|--help]
+
+v2rayN 严格健康检查:核验「TUN 全局代理 + 系统代理」链路是否真正生效。
+无参数直接运行即可完成全部检查(约 5 秒)。
+
+退出码:
+  0  服务正常(可能带 WARN)
+  1  存在 FAIL 失败项,建议重启 v2rayN 后重试
+  2  基础命令缺失,无法完成检查
+
+可用环境变量(当前生效值):
+  PROXY_HOST=${PROXY_HOST}                本地代理监听地址
+  PROXY_PORT=${PROXY_PORT}                     本地代理监听端口
+  REQUIRE_TUN=${REQUIRE_TUN}                       1=TUN 缺失记 FAIL,0=降级 WARN
+  TUN_ADDR=${TUN_ADDR}                 sing-box TUN 网关地址
+  TEST_URL=${TEST_URL}
+  IP_URL=${IP_URL}
+  TIMEOUT=${TIMEOUT}                         每次 curl 的最大秒数
+  SERVER_ADDR=${SERVER_ADDR:-<自动从配置提取>}
+  SERVER_PORT=${SERVER_PORT:-<自动从配置提取>}
+  SERVER_PROBE_TIMEOUT=${SERVER_PROBE_TIMEOUT}              server TCP 探测超时秒数
+  CHECK_APPS='${CHECK_APPS}'
+
+示例:
+  $(basename "$0")                          # 常规检查
+  REQUIRE_TUN=0 $(basename "$0")            # 未开 TUN 时不报 FAIL
+  PROXY_PORT=10809 $(basename "$0")         # 改用 10809 端口
+USAGE
+}
+
+# 参数解析:仅支持帮助开关。其余参数一律提示后退出,避免像以前那样
+# 静默忽略拼错的参数、让人以为某个开关生效了。
+case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  '') : ;;
+  *)
+    printf '未知参数: %s\n\n' "$1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
 failures=0
 warnings=0
 

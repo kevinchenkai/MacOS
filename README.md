@@ -46,6 +46,14 @@ chmod +x check_v2rayn.sh
 PROXY_PORT=10809 REQUIRE_TUN=0 ./check_v2rayn.sh
 ```
 
+查看用法、退出码与当前生效的全部环境变量取值：
+
+```bash
+./check_v2rayn.sh --help
+```
+
+`--help` / `-h` 会打印帮助后以 `0` 退出，不执行任何检查；传入无法识别的参数则打印提示到 stderr 并以 `2` 退出，避免拼错的参数被静默忽略。
+
 ### 退出码
 
 | 退出码 | 含义 |
